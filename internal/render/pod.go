@@ -16,34 +16,6 @@ import (
 	mv1beta1 "k8s.io/metrics/pkg/apis/metrics/v1beta1"
 )
 
-const (
-	requestCPU qualifiedResource = "rcpu"
-	requestMEM qualifiedResource = "rmem"
-	limitCPU   qualifiedResource = "lcpu"
-	limitMEM   qualifiedResource = "lmem"
-)
-
-type (
-	qualifiedResource string
-	percentages       map[qualifiedResource]int
-)
-
-func newPercentages() percentages {
-	return make(percentages, 4)
-}
-func (p percentages) rCPU() int {
-	return p[requestCPU]
-}
-func (p percentages) rMEM() int {
-	return p[requestMEM]
-}
-func (p percentages) lCPU() int {
-	return p[limitCPU]
-}
-func (p percentages) lMEM() int {
-	return p[limitMEM]
-}
-
 // Pod renders a K8s Pod to screen.
 type Pod struct{}
 
@@ -104,12 +76,14 @@ func (Pod) Header(ns string) Header {
 		HeaderColumn{Name: "QOS", Wide: true},
 		HeaderColumn{Name: "LABELS", Wide: true},
 		HeaderColumn{Name: "VALID", Wide: true},
+		HeaderColumn{Name: "NOMINATED NODE", Wide: true},
+		HeaderColumn{Name: "READINESS GATES", Wide: true},
 		HeaderColumn{Name: "AGE", Time: true, Decorator: AgeDecorator},
 	}
 }
 
 // Render renders a K8s resource to screen.
-func (p Pod) Render(o interface{}, ns string, r *Row) error {
+func (p Pod) Render(o interface{}, ns string, row *Row) error {
 	pwm, ok := o.(*PodWithMetrics)
 	if !ok {
 		return fmt.Errorf("Expected PodWithMetrics, but got %T", o)
@@ -122,10 +96,11 @@ func (p Pod) Render(o interface{}, ns string, r *Row) error {
 
 	ss := po.Status.ContainerStatuses
 	cr, _, rc := p.Statuses(ss)
-	c, perc, res := p.gatherPodMX(&po, pwm.MX)
+
+	c, r := p.gatherPodMX(&po, pwm.MX)
 	phase := p.Phase(&po)
-	r.ID = client.MetaFQN(po.ObjectMeta)
-	r.Fields = Fields{
+	row.ID = client.MetaFQN(po.ObjectMeta)
+	row.Fields = Fields{
 		po.Namespace,
 		po.ObjectMeta.Name,
 		"●",
@@ -134,17 +109,19 @@ func (p Pod) Render(o interface{}, ns string, r *Row) error {
 		phase,
 		toMc(c.cpu),
 		toMi(c.mem),
-		toMc(res.cpu) + ":" + toMc(res.lcpu),
-		toMi(res.mem) + ":" + toMi(res.lmem),
-		strconv.Itoa(perc.rCPU()),
-		strconv.Itoa(perc.lCPU()),
-		strconv.Itoa(perc.rMEM()),
-		strconv.Itoa(perc.lMEM()),
+		toMc(r.cpu) + ":" + toMc(r.lcpu),
+		toMi(r.mem) + ":" + toMi(r.lmem),
+		client.ToPercentageStr(c.cpu, r.cpu),
+		client.ToPercentageStr(c.cpu, r.lcpu),
+		client.ToPercentageStr(c.mem, r.mem),
+		client.ToPercentageStr(c.mem, r.lmem),
 		na(po.Status.PodIP),
 		na(po.Spec.NodeName),
 		p.mapQOS(po.Status.QOSClass),
 		mapToStr(po.Labels),
 		asStatus(p.diagnose(phase, cr, len(ss))),
+		asNominated(po.Status.NominatedNodeName),
+		asReadinessGate(po),
 		toAge(po.ObjectMeta.CreationTimestamp),
 	}
 
@@ -165,6 +142,34 @@ func (p Pod) diagnose(phase string, cr, ct int) error {
 // ----------------------------------------------------------------------------
 // Helpers...
 
+func asNominated(n string) string {
+	if n == "" {
+		return MissingValue
+	}
+	return n
+}
+
+func asReadinessGate(pod v1.Pod) string {
+	if len(pod.Spec.ReadinessGates) == 0 {
+		return MissingValue
+	}
+
+	trueConditions := 0
+	for _, readinessGate := range pod.Spec.ReadinessGates {
+		conditionType := readinessGate.ConditionType
+		for _, condition := range pod.Status.Conditions {
+			if condition.Type == conditionType {
+				if condition.Status == "True" {
+					trueConditions++
+				}
+				break
+			}
+		}
+	}
+
+	return strconv.Itoa(trueConditions) + "/" + strconv.Itoa(len(pod.Spec.ReadinessGates))
+}
+
 // PodWithMetrics represents a pod and its metrics.
 type PodWithMetrics struct {
 	Raw *unstructured.Unstructured
@@ -181,27 +186,16 @@ func (p *PodWithMetrics) DeepCopyObject() runtime.Object {
 	return p
 }
 
-func (*Pod) gatherPodMX(pod *v1.Pod, mx *mv1beta1.PodMetrics) (metric, percentages, metric) {
-	var c, r metric
-	p := newPercentages()
-
+func (*Pod) gatherPodMX(pod *v1.Pod, mx *mv1beta1.PodMetrics) (c, r metric) {
 	rcpu, rmem := podRequests(pod.Spec)
 	lcpu, lmem := podLimits(pod.Spec)
-	r.cpu, r.lcpu = rcpu.MilliValue(), lcpu.MilliValue()
-	r.mem, r.lmem = rmem.Value(), lmem.Value()
-
-	if mx == nil {
-		return c, p, r
+	r.cpu, r.lcpu, r.mem, r.lmem = rcpu.MilliValue(), lcpu.MilliValue(), rmem.Value(), lmem.Value()
+	if mx != nil {
+		ccpu, cmem := currentRes(mx)
+		c.cpu, c.mem = ccpu.MilliValue(), cmem.Value()
 	}
 
-	ccpu, cmem := currentRes(mx)
-	c.cpu = ccpu.MilliValue()
-	c.mem = cmem.Value()
-
-	p[requestCPU], p[limitCPU] = client.ToPercentage(c.cpu, r.cpu), client.ToPercentage(c.cpu, r.lcpu)
-	p[requestMEM], p[limitMEM] = client.ToPercentage(c.mem, r.mem), client.ToPercentage(c.mem, r.lmem)
-
-	return c, p, r
+	return
 }
 
 func containerRequests(co *v1.Container) v1.ResourceList {
@@ -220,12 +214,15 @@ func containerRequests(co *v1.Container) v1.ResourceList {
 func podLimits(spec v1.PodSpec) (resource.Quantity, resource.Quantity) {
 	cpu, mem := new(resource.Quantity), new(resource.Quantity)
 	for _, co := range spec.Containers {
-		limit := co.Resources.Limits
-		if limit.Cpu() != nil {
-			cpu.Add(*limit.Cpu())
+		limits := co.Resources.Limits
+		if len(limits) == 0 {
+			return resource.Quantity{}, resource.Quantity{}
 		}
-		if limit.Memory() != nil {
-			mem.Add(*limit.Memory())
+		if limits.Cpu() != nil {
+			cpu.Add(*limits.Cpu())
+		}
+		if limits.Memory() != nil {
+			mem.Add(*limits.Memory())
 		}
 	}
 	return *cpu, *mem
@@ -260,6 +257,7 @@ func currentRes(mx *mv1beta1.PodMetrics) (resource.Quantity, resource.Quantity) 
 }
 
 func (*Pod) mapQOS(class v1.PodQOSClass) string {
+	// nolint:exhaustive
 	switch class {
 	case v1.PodQOSGuaranteed:
 		return "GA"

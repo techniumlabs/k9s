@@ -72,7 +72,7 @@ func (n Node) Render(o interface{}, ns string, r *Row) error {
 	iIP, eIP := getIPs(no.Status.Addresses)
 	iIP, eIP = missing(iIP), missing(eIP)
 
-	c, p, a := gatherNodeMX(&no, oo.MX)
+	c, a := gatherNodeMX(&no, oo.MX)
 	statuses := make(sort.StringSlice, 10)
 	status(no.Status.Conditions, no.Spec.Unschedulable, statuses)
 	sort.Sort(statuses)
@@ -92,8 +92,8 @@ func (n Node) Render(o interface{}, ns string, r *Row) error {
 		strconv.Itoa(oo.PodCount),
 		toMc(c.cpu),
 		toMi(c.mem),
-		strconv.Itoa(p.rCPU()),
-		strconv.Itoa(p.rMEM()),
+		client.ToPercentageStr(c.cpu, a.cpu),
+		client.ToPercentageStr(c.mem, a.mem),
 		toMc(a.cpu),
 		toMi(a.mem),
 		mapToStr(no.Labels),
@@ -154,22 +154,13 @@ type metric struct {
 	lcpu, lmem int64
 }
 
-func gatherNodeMX(no *v1.Node, mx *mv1beta1.NodeMetrics) (metric, percentages, metric) {
-	var c metric
-	p := newPercentages()
-	a := metric{
-		cpu: no.Status.Allocatable.Cpu().MilliValue(),
-		mem: no.Status.Allocatable.Memory().Value(),
-	}
-	if mx == nil {
-		return c, p, a
+func gatherNodeMX(no *v1.Node, mx *mv1beta1.NodeMetrics) (c, a metric) {
+	a.cpu, a.mem = no.Status.Allocatable.Cpu().MilliValue(), no.Status.Allocatable.Memory().Value()
+	if mx != nil {
+		c.cpu, c.mem = mx.Usage.Cpu().MilliValue(), mx.Usage.Memory().Value()
 	}
 
-	c.cpu, c.mem = mx.Usage.Cpu().MilliValue(), mx.Usage.Memory().Value()
-	p[requestCPU] = client.ToPercentage(c.cpu, a.cpu)
-	p[requestMEM] = client.ToPercentage(c.mem, a.mem)
-
-	return c, p, a
+	return
 }
 
 func nodeRoles(node *v1.Node, res []string) {
@@ -197,6 +188,7 @@ func nodeRoles(node *v1.Node, res []string) {
 
 func getIPs(addrs []v1.NodeAddress) (iIP, eIP string) {
 	for _, a := range addrs {
+		// nolint:exhaustive
 		switch a.Type {
 		case v1.NodeExternalIP:
 			eIP = a.Address
@@ -228,7 +220,6 @@ func status(conds []v1.NodeCondition, exempt bool, res []string) {
 		}
 		res[index] = neg + string(condition.Type)
 		index++
-
 	}
 	if len(res) == 0 {
 		res[index] = "Unknown"
